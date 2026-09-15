@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to the same branch makes an in-flight run obsolete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ledger
+          POSTGRES_PASSWORD: ledger
+          POSTGRES_DB: ledger
+        ports:
+          - 5432:5432
+        # The concurrency suite is the point of this project, so CI runs it
+        # against a REAL Postgres service container. Mocking the database here
+        # would make the tests assert nothing.
+        options: >-
+          --health-cmd "pg_isready -U ledger"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 10s
+
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgres://ledger:ledger@localhost:5432/ledger
+      TEST_DATABASE_URL: postgres://ledger:ledger@localhost:5432/ledger_test
+      # CI-only throwaway secrets. Real deployments inject these from a secret
+      # store; they are inline here precisely because they must never be real.
+      JWT_ACCESS_SECRET: ci-access-secret-0123456789abcdef0123456789abcdef
+      JWT_REFRESH_SECRET: ci-refresh-secret-0123456789abcdef0123456789abcde
+      LOG_LEVEL: silent
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Raise Postgres connection limit
+        # The stress tests hold many connections in lock waits simultaneously;
+        # the service container's default max_connections=100 is too low.
+        run: |
+          psql "$DATABASE_URL" -c "ALTER SYSTEM SET max_connections = 300;"
+          psql "$DATABASE_URL" -c "ALTER SYSTEM SET deadlock_timeout = '200ms';"
+          psql "$DATABASE_URL" -c "ALTER SYSTEM SET log_lock_waits = on;"
+          psql "$DATABASE_URL" -c "SELECT pg_reload_conf();"
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm run test:unit
+
+      - name: Integration tests (real Postgres, real concurrency)
+        run: npm run test:integration
+
+      - name: Verify migrations apply cleanly from scratch
+        run: npm run migrate
+
+      - name: Verify seed script runs
+        run: npm run seed
+
+      - name: Assert the global double-entry invariant on seeded data
+        run: |
+          DRIFT=$(psql "$DATABASE_URL" -tAc \
+            "SELECT COALESCE(SUM(signed_amount), 0) FROM ledger_entries")
+          echo "SUM(credits) - SUM(debits) = $DRIFT"
+          if [ "$DRIFT" != "0" ]; then
+            echo "::error::Global double-entry invariant violated: drift=$DRIFT"
+            exit 1
+          fi
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
