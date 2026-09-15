@@ -1,314 +1,188 @@
-# Ledger — digital wallet backend with a double-entry ledger
+# Ledger — double-entry wallet backend
 
-A wallet API where **balances are derived, never stored**. There is no
-`wallets.balance` column to update, drift, or corrupt. A balance is the sum of
-that wallet's immutable ledger entries, and every transfer writes a matched
-debit and credit inside one database transaction.
+[![CI](https://github.com/Vrinda-Vijay5/double-entry-wallet-ledger/actions/workflows/ci.yml/badge.svg)](https://github.com/Vrinda-Vijay5/double-entry-wallet-ledger/actions/workflows/ci.yml)
 
-The engineering goal is provable correctness under concurrent load: no
+A digital wallet API where **balances are derived, never stored**. There is no
+`balance` column to update, drift, or corrupt — a balance is the sum of that
+wallet's immutable ledger entries, and every transfer writes a matched debit and
+credit inside a single database transaction.
+
+The project's goal is **provable correctness under concurrent load**: no
 overdrafts, no deadlocks, no duplicate transfers, and `SUM(debits) =
-SUM(credits)` at all times.
+SUM(credits)` at all times — verified by a test suite that fires hundreds of
+parallel requests at a real PostgreSQL instance.
 
-```
-Express + TypeScript · PostgreSQL · raw pg (explicit SELECT ... FOR UPDATE)
-Jest + Supertest · Zod · Pino · Docker Compose · GitHub Actions
-```
+**118 tests · 10 suites · CI on Node 20 & 22 against PostgreSQL 16**
 
 ---
 
-## Contents
+## Tech stack
 
-- [Quick start](#quick-start)
-- [Architecture](#architecture)
-- [Data model](#data-model)
-- [API](#api)
-- [Concurrency and idempotency design](#concurrency-and-idempotency-design)
-- [Tests](#tests)
-- [Project layout](#project-layout)
+| Layer | Choice | Why |
+|---|---|---|
+| Runtime | Node.js 20+, TypeScript (strict) | — |
+| Framework | Express | Explicitly not NestJS — no DI framework needed at this size |
+| Database | PostgreSQL 16 | Deferred constraint triggers and row-level locking |
+| Data access | Raw `pg` | Explicit `SELECT … FOR UPDATE`; no ORM hiding the locking |
+| Validation | Zod | Parse-at-the-boundary, inferred types |
+| Auth | Argon2id, JWT, rotating refresh tokens | OWASP-profile hashing, revocable refresh |
+| Logging | Pino | Structured JSON with credential redaction |
+| Testing | Jest + Supertest | Real Postgres, never a mock, for concurrency |
+| CI | GitHub Actions | Postgres service container, Node 20 + 22 matrix |
 
 ---
 
-## Quick start
+## Key engineering highlights
 
-From a clean clone:
+**Money is never stored as a mutable number.** Balances are derived via
+`SUM(signed_amount)` over an append-only ledger. `UPDATE` and `DELETE` on ledger
+rows raise a database exception, so the ledger is immutable even from `psql`.
 
-```bash
-cp .env.example .env
-docker compose up -d        # Postgres on :5432
-npm install
-npm run migrate
-npm run seed                # optional demo data
-npm test
-```
+**Core invariants are enforced by PostgreSQL, not application code.** A
+`DEFERRABLE INITIALLY DEFERRED` constraint trigger validates at `COMMIT` that
+every transfer has exactly two entries whose debits equal its credits. A
+transaction that writes a debit without its credit *cannot commit* — not
+"should not", cannot. That guarantee survives any future bug in the service layer.
 
-`npm test` runs unit tests and integration tests. The integration suite creates
-and migrates a separate `ledger_test` database on every run, so it never touches
-your development data.
+**Deadlock-free by construction.** Transfers lock every wallet they touch in
+ascending ID order. Since whichever ID sorts lower is always acquired first by
+both parties, the wait-for graph cannot contain a cycle — simultaneous A→B and
+B→A transfers queue instead of deadlocking.
 
-To run the server:
+**Idempotency that holds under simultaneous duplicates**, not just sequential
+retries. The mechanism is a single unique index plus PostgreSQL's
+`INSERT … ON CONFLICT DO NOTHING` blocking behaviour. 40 identical concurrent
+requests produce exactly one transfer.
 
-```bash
-npm run dev                 # tsx watch
-# or
-npm run build && npm start
-```
+**Exact integer arithmetic end to end.** Amounts are `bigint` minor units in
+both PostgreSQL and TypeScript, serialised as JSON strings. `int8` is
+deliberately left as a string at the driver boundary — coercing it to a JS
+number would silently lose precision above 2⁵³.
 
-### Without Docker
-
-Any reachable Postgres 14+ works. Create the role and databases, then point
-`DATABASE_URL` and `TEST_DATABASE_URL` at them:
-
-```sql
-CREATE ROLE ledger LOGIN PASSWORD 'ledger' CREATEDB;
-CREATE DATABASE ledger OWNER ledger;
-```
-
-The suite creates `ledger_test` itself, which is why the role needs `CREATEDB`.
-
-> **Connection limits.** The stress tests hold dozens of connections in lock
-> waits simultaneously. Postgres' default `max_connections = 100` is enough for
-> the suite as configured (pool max 60), but if you raise `PG_POOL_MAX`, raise
-> `max_connections` to match or you will see connection errors that look like
-> concurrency bugs and are not.
-
-### Demo credentials
-
-`npm run seed` creates `admin@demo.ledger` (admin), `alice@demo.ledger`, and
-`bob@demo.ledger`, all with password `demo-password-123`.
+**The concurrency tests were written to fail first.** See
+[the test-design note](#what-the-stress-test-actually-proves) — the obvious
+version of a stress test cannot fail in this architecture, and the commit
+history shows the real `-2200n` overdraft that the discriminating version caught.
 
 ---
 
 ## Architecture
 
 ```
-                      ┌──────────────────────────────────────────┐
-  HTTP                │  Express app (src/app.ts)                │
-  ──────────────────► │                                          │
-                      │  requestId → pino-http → json(64kb)      │
-                      └────────────────┬─────────────────────────┘
-                                       │
-                 ┌─────────────────────┼─────────────────────┐
-                 ▼                     ▼                     ▼
-          ┌─────────────┐      ┌──────────────┐      ┌──────────────┐
-          │ /v1/auth    │      │ /v1/wallets  │      │ /v1/transfers│
-          │ rateLimit   │      │ requireAuth  │      │ requireAuth  │
-          │ Zod parse   │      │ Zod parse    │      │ Zod parse    │
-          └──────┬──────┘      └──────┬───────┘      └──────┬───────┘
-                 │                    │                     │
-                 │              requireIdempotencyKey (mutating routes)
-                 │                    │                     │
-                 └────────────────────┼─────────────────────┘
-                                      ▼
-                       ┌──────────────────────────────┐
-                       │ withTransaction()            │
-                       │   BEGIN READ COMMITTED       │
-                       │                              │
-                       │  ┌────────────────────────┐  │
-                       │  │ runIdempotent()        │  │  ① claim key
-                       │  │  INSERT ... ON CONFLICT│  │     (unique index
-                       │  │    DO NOTHING          │  │      elects one winner)
-                       │  └───────────┬────────────┘  │
-                       │              ▼               │
-                       │  ┌────────────────────────┐  │
-                       │  │ executeTransfer()      │  │
-                       │  │  ② lock wallets ASC    │  │  ← deadlock-free
-                       │  │  ③ derive balance      │  │
-                       │  │  ④ overdraft check     │  │
-                       │  │  ⑤ INSERT transfer     │  │
-                       │  │  ⑥ INSERT both entries │  │
-                       │  └───────────┬────────────┘  │
-                       │              ▼               │
-                       │        store response        │  ⑦
-                       │           COMMIT             │
-                       └──────────────┬───────────────┘
-                                      ▼
-   ┌──────────────────────────────────────────────────────────────┐
-   │ PostgreSQL                                                   │
-   │                                                              │
-   │  ledger_entries ── append-only (UPDATE/DELETE triggers raise)│
-   │        │                                                     │
-   │        └── DEFERRABLE constraint trigger at COMMIT:          │
-   │            exactly 2 entries per transfer, debits = credits  │
-   │                                                              │
-   │  balance(w) := SUM(signed_amount) WHERE wallet_id = w        │
-   └──────────────────────────────────────────────────────────────┘
+  HTTP  ─►  requestId ─► pino-http ─► json(64kb)
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+   /v1/auth             /v1/wallets           /v1/transfers
+   rateLimit            requireAuth           requireAuth
+   Zod parse            Zod parse             Zod parse
+        └──────── requireIdempotencyKey (mutating routes) ────────┘
+                              │
+                              ▼
+        ┌─────────────────────────────────────────────┐
+        │ withTransaction()   BEGIN READ COMMITTED    │
+        │                                             │
+        │   ① claim Idempotency-Key                   │
+        │      INSERT … ON CONFLICT DO NOTHING        │
+        │   ② lock wallets in ASCENDING id order      │  ← deadlock-free
+        │   ③ derive balance (inside the lock)        │
+        │   ④ overdraft check                         │
+        │   ⑤ INSERT transfer                         │
+        │   ⑥ INSERT both ledger entries (1 stmt)     │
+        │   ⑦ store response                          │
+        │                     COMMIT                  │
+        └─────────────────────┬───────────────────────┘
+                              ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │ PostgreSQL                                               │
+  │   ledger_entries — append-only (UPDATE/DELETE triggers)  │
+  │   DEFERRABLE trigger @ COMMIT: 2 entries, debits=credits │
+  │   balance(w) := SUM(signed_amount) WHERE wallet_id = w    │
+  └──────────────────────────────────────────────────────────┘
 ```
 
-Steps ① through ⑦ all happen in **one** transaction. That is the single most
-important property of the design: the idempotency claim, the money movement, and
-the stored response commit together or not at all.
+Steps ① – ⑦ share **one** transaction. That is the design's load-bearing
+property: the idempotency claim, the money movement, and the stored response
+commit together or not at all.
 
 ### Layering
 
-| Layer | Responsibility | Knows about |
+| Layer | Responsibility | Depends on |
 |---|---|---|
 | `routes` | HTTP shape, Zod parsing, status codes | Express |
-| `service` | Business rules, locking, SQL | `pg`, domain |
-| `domain` | Pure arithmetic and invariants | nothing |
+| `services` | Business rules, locking, SQL | `pg`, domain |
+| `domain` | Pure arithmetic and invariants | **nothing** |
 | `db` | Pool, transactions, migrations | `pg` |
 
-`src/domain` has no imports from anywhere else in the project and no I/O, which
-is what lets the ledger rules be unit tested without a database.
+`src/domain` has no I/O and no imports from the rest of the app, which is what
+lets the ledger rules be unit tested without a database.
 
 ---
 
-## Data model
+## Setup
 
-```
-users ──┬── wallets ──┬── ledger_entries ──── transfers
-        │             │         ▲                 ▲
-        │             │         └─────────────────┘
-        │             │            2 rows per transfer
-        │             │            (one debit, one credit)
-        │
-        ├── refresh_tokens   (rotation family, hashed)
-        └── idempotency_keys (unique per user+key)
+```bash
+cp .env.example .env
+docker compose up -d --wait     # PostgreSQL on :5432
+npm install
+npm run migrate
+npm run seed                    # optional demo data
+npm test
 ```
 
-**`ledger_entries`** is the only place value exists.
+Run the server with `npm run dev`, or `npm run build && npm start`.
+
+<details>
+<summary>Without Docker</summary>
+
+Any PostgreSQL 14+ works. Create the role and database, then point
+`DATABASE_URL` / `TEST_DATABASE_URL` at them:
 
 ```sql
-signed_amount bigint GENERATED ALWAYS AS (
-  CASE WHEN direction = 'credit' THEN amount ELSE -amount END
-) STORED
+CREATE ROLE ledger LOGIN PASSWORD 'ledger' CREATEDB;
+CREATE DATABASE ledger OWNER ledger;
 ```
 
-So a balance is `SUM(signed_amount)` for one wallet, and the global invariant is
-`SUM(signed_amount) = 0` across the entire table.
+`CREATEDB` is required because the integration suite creates and drops its own
+`ledger_test` database on every run.
+</details>
 
-**Money is integer minor units (cents) in `bigint`.** There is no floating point
-anywhere on the money path. `pg` returns `int8` as a string and we deliberately
-keep it that way — coercing to a JS number would silently lose precision above
-2⁵³. Amounts are `bigint` in TypeScript and **strings in JSON**, because JSON
-numbers cannot hold `int8` safely.
+<details>
+<summary>Demo credentials</summary>
 
-**Funding is not a magic balance insert** — there is no balance to insert into.
-A `system` wallet, permitted to go negative, is the counterparty for money
-entering the system. So even a deposit writes a matched pair and the global
-invariant holds for seeded and production data alike.
+`npm run seed` creates `admin@demo.ledger` (admin), `alice@demo.ledger`, and
+`bob@demo.ledger` — password `demo-password-123` for all three.
 
-### Database-enforced guarantees
-
-These are enforced by the schema, so they survive a bug in the service layer:
-
-| Guarantee | Mechanism |
-|---|---|
-| Ledger rows never change | `BEFORE UPDATE OR DELETE` trigger raises |
-| Every transfer has exactly 2 entries | `DEFERRABLE INITIALLY DEFERRED` constraint trigger at COMMIT |
-| Debits equal credits per transfer | same trigger |
-| One debit and one credit, never two of a side | unique index on `(transfer_id, direction)` |
-| Amounts are positive | `CHECK (amount > 0)` |
-| Only system wallets go negative | `CHECK (NOT allow_negative OR kind = 'system')` |
-| One idempotency record per user+key | `UNIQUE (user_id, idempotency_key)` |
-
-`tests/integration/schema-invariants.test.ts` proves each of these by going
-around the API and talking to Postgres directly.
+Funding is not a balance insert. A `system` wallet permitted to go negative acts
+as the counterparty, so even seeded money arrives via a real double-entry
+transfer and the global invariant holds from the first row.
+</details>
 
 ---
 
 ## API
 
-Base path `/v1`. All responses are JSON. Errors look like:
+Base path `/v1`. Errors return `{ error: { code, message, details? }, requestId }` —
+branch on `error.code`, not the message.
 
-```json
-{
-  "error": { "code": "insufficient_funds", "message": "...", "details": { } },
-  "requestId": "…"
-}
-```
+**Conventions.** Bearer token on everything except register/login/refresh/health.
+`Idempotency-Key` is **required on every mutating request**. Amounts are strings
+of integer minor units (`"2500"` = $25.00).
 
-Branch on `error.code`, not on the message.
-
-### Conventions
-
-- **Auth**: `Authorization: Bearer <accessToken>` on everything except
-  register, login, refresh, and health.
-- **Idempotency-Key**: **required** on every mutating request
-  (`POST`/`PUT`/`PATCH`/`DELETE`), 8–255 chars of `[A-Za-z0-9_.:-]`.
-  Use a fresh UUID per logical operation and reuse it when retrying that
-  operation.
-- **Amounts** are strings of integer minor units: `"2500"` is $25.00.
-  Requests also accept a JSON integer.
-
-### Auth
-
-| Method | Path | Body | Notes |
-|---|---|---|---|
-| `POST` | `/v1/auth/register` | `{email, password}` | password ≥ 12 chars. Returns user + token pair |
-| `POST` | `/v1/auth/login` | `{email, password}` | Returns user + token pair |
-| `POST` | `/v1/auth/refresh` | `{refreshToken}` | Rotates. Old token becomes invalid |
-| `POST` | `/v1/auth/logout` | — | Revokes all refresh tokens for the user |
-| `GET` | `/v1/auth/me` | — | Current user id and role |
-
-Access tokens are HS256 JWTs valid for **15 minutes**. Refresh tokens are opaque
-random strings valid for **7 days** and rotate on every use.
-
-`POST /v1/auth/refresh` is deliberately **exempt** from `Idempotency-Key`:
-rotation is non-idempotent by design, and replaying a cached response would hand
-back the same refresh token twice, defeating rotation. The refresh token is
-itself the single-use key.
-
-<details>
-<summary>Example</summary>
-
-```bash
-curl -s localhost:3000/v1/auth/login \
-  -H 'content-type: application/json' \
-  -d '{"email":"alice@demo.ledger","password":"demo-password-123"}'
-```
-```json
-{
-  "user": { "id": "…", "email": "alice@demo.ledger", "role": "customer" },
-  "accessToken": "eyJhbGciOiJIUzI1NiIs…",
-  "refreshToken": "kR3f…",
-  "expiresIn": 900
-}
-```
-</details>
-
-### Wallets
-
-| Method | Path | Notes |
+| Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/v1/wallets` | `{label}`. Needs `Idempotency-Key` |
-| `GET` | `/v1/wallets` | Your wallets, each with a derived balance |
-| `GET` | `/v1/wallets/:id` | One wallet + balance |
-| `GET` | `/v1/wallets/:id/balance` | **The balance endpoint** — always computed |
-| `GET` | `/v1/wallets/:id/ledger` | Entries, `?limit=` (≤200) `&offset=` |
-
-A user may own **one or more** wallets. Accessing a wallet you do not own
-returns **404, not 403** — a 403 would confirm the id is real and turn the
-endpoint into an id-enumeration oracle. Admins may read any wallet.
-
-<details>
-<summary>Example</summary>
-
-```bash
-curl -s localhost:3000/v1/wallets/$WALLET/balance -H "authorization: Bearer $TOKEN"
-```
-```json
-{
-  "walletId": "…",
-  "currency": "USD",
-  "balance": "37500",
-  "derivedAt": "2026-09-15T12:00:00.000Z"
-}
-```
-</details>
-
-### Transfers
-
-| Method | Path | Notes |
-|---|---|---|
-| `POST` | `/v1/transfers` | `{sourceWalletId, destWalletId, amount, reference?}` |
-| `GET` | `/v1/transfers/:id` | Visible to either counterparty |
-
-You may only move money **out of** a wallet you own; anyone may be the
-destination. A replayed request returns the original response with
-`Idempotent-Replay: true`.
-
-<details>
-<summary>Example</summary>
+| `POST` | `/v1/auth/register` | Create account, returns token pair |
+| `POST` | `/v1/auth/login` | Authenticate, returns token pair |
+| `POST` | `/v1/auth/refresh` | Rotate refresh token |
+| `POST` | `/v1/auth/logout` | Revoke all refresh tokens |
+| `GET` | `/v1/auth/me` | Current user and role |
+| `POST` | `/v1/wallets` | Create a wallet |
+| `GET` | `/v1/wallets` | List own wallets with balances |
+| `GET` | `/v1/wallets/:id` | Wallet detail |
+| `GET` | `/v1/wallets/:id/balance` | **Derived balance** — always computed |
+| `GET` | `/v1/wallets/:id/ledger` | Paginated ledger entries |
+| `POST` | `/v1/transfers` | Transfer between wallets |
+| `GET` | `/v1/transfers/:id` | Transfer with both ledger entries |
 
 ```bash
 curl -s localhost:3000/v1/transfers \
@@ -317,187 +191,97 @@ curl -s localhost:3000/v1/transfers \
   -H 'content-type: application/json' \
   -d '{"sourceWalletId":"…","destWalletId":"…","amount":"2500","reference":"rent"}'
 ```
-```json
-{
-  "id": "…",
-  "sourceWalletId": "…",
-  "destWalletId": "…",
-  "amount": "2500",
-  "reference": "rent",
-  "createdAt": "2026-09-15T12:00:00.000Z",
-  "sourceBalance": "7500",
-  "destBalance": "2500"
-}
-```
-</details>
 
-### Status codes
-
-| Code | Meaning |
+| Status | Meaning |
 |---|---|
 | `400` | Validation failed, or `Idempotency-Key` missing/malformed |
-| `401` | Missing, invalid, or expired token |
-| `403` | Authenticated but wrong role |
-| `404` | Not found, **or** exists but is not yours |
+| `401` / `403` | Bad token / wrong role |
+| `404` | Not found — **or exists but isn't yours** (prevents ID enumeration) |
 | `409` | Email taken, or key reused with a different payload |
-| `422` | `insufficient_funds` — well-formed, but the money is not there |
+| `422` | `insufficient_funds` — well-formed request, money isn't there |
 | `429` | Auth rate limit |
 
-`422` rather than `400` for overdrafts is deliberate: the request was
-well-formed and the client had no way to know it would fail, since the balance
-may have changed between their read and their write.
+Access tokens are HS256 JWTs valid 15 minutes. Refresh tokens are opaque random
+strings valid 7 days, rotate on every use, and are stored only as HMACs.
+Presenting an already-rotated token revokes the entire token family.
 
 ---
 
 ## Concurrency and idempotency design
 
-Four decisions carry the correctness argument. `DESIGN_NOTES.md` covers them in
-depth; this is the summary.
+Full reasoning in **[DESIGN_NOTES.md](DESIGN_NOTES.md)**. Summary:
 
-### 1. Isolation level: READ COMMITTED, chosen not inherited
+**Isolation level — READ COMMITTED, chosen deliberately.** The anomaly to prevent
+is a lost update on a derived balance: two transfers both read 100, both approve
+a withdrawal of 100, both append a debit. Neither READ COMMITTED nor REPEATABLE
+READ prevents this, because the balance aggregates rows that *don't exist yet* —
+the two transactions never touch a common tuple, so snapshot isolation sees no
+conflict. SERIALIZABLE *would* prevent it, but optimistically: under 200 parallel
+transfers on one wallet nearly every transaction conflicts on the same predicate,
+so the abort rate approaches 100% and throughput collapses into a retry storm.
+Pessimistic row locking gives the same guarantee with bounded, retry-free latency.
 
-The anomaly to prevent is a **lost update on a derived balance**: two transfers
-both read balance 100, both approve a withdrawal of 100, both append a debit,
-wallet ends at −100.
+**Lock ordering.** Every transfer locks all wallets it touches with
+`SELECT … FOR UPDATE` in ascending ID order before reading any balance. A
+deadlock needs T1 holding X wanting Y while T2 holds Y wanting X; under a global
+ordering the lower ID is always acquired first by both, so that state is
+unreachable. The argument extends unchanged to three or more wallets.
 
-READ COMMITTED does not prevent this on its own — the balance is an aggregate
-over rows that *do not exist yet*, so there is no tuple for the database to
-detect a conflict on. REPEATABLE READ does not prevent it either: the two
-transactions insert *different* rows and never touch a common tuple, so snapshot
-isolation sees no conflict.
+**The wallet row is a mutex.** It holds no money — it exists so there is a
+pre-existing row to serialise on, since you cannot lock rows that don't exist
+yet. The rule: *any path appending entries for a wallet must first hold that
+wallet's row lock*, which turns read-balance → decide → append into one critical
+section.
 
-We close the hole explicitly with row locks instead (below).
-
-**Why not SERIALIZABLE**, which would also prevent it? Because it prevents it
-*optimistically*, by aborting one transaction with `40001` and requiring a
-retry. Under the workload this project exists to survive — 200 parallel
-transfers against one wallet — every transaction conflicts on the same
-predicate, so the abort rate approaches 100% and throughput collapses into a
-retry storm. Pessimistic locking gives the same guarantee for this access
-pattern with bounded, retry-free latency: contenders queue instead of failing.
-
-The full justification lives in a comment on `TransactionOptions` in
-`src/db/tx.ts`.
-
-### 2. Deterministic lock ordering
-
-Every transfer locks **all** wallets it touches with `SELECT … FOR UPDATE`,
-in **ascending wallet id order**, before reading any balance.
-
-Locking in request order (source, then destination) deadlocks: simultaneous
-A→B and B→A take `(A,B)` and `(B,A)`, each holding what the other wants.
-Under a global ordering, whichever id sorts lower is acquired first by *both*,
-so no transaction can hold the higher id while waiting for the lower one. The
-wait-for graph is acyclic by construction, and the argument extends unchanged to
-three or more wallets.
-
-The rule is implemented in `lockWalletsInOrder()` in
-`src/modules/transfers/transfers.service.ts`, documented in a comment at that
-exact spot, and the ordering function itself is unit tested in
-`tests/unit/ledger.test.ts`.
-
-Locks are taken one statement at a time rather than with a combined
-`WHERE id = ANY(…) ORDER BY id FOR UPDATE`. The combined form almost certainly
-locks in sorted order too, but that rests on `LockRows` staying above `Sort` in
-the query plan. The ordering is load-bearing, so it is a property of the code
-rather than of the planner.
-
-**The invariant this establishes:** the wallet row is the designated *mutex* for
-that wallet's slice of the ledger. Any code path appending entries for a wallet
-must first hold that wallet's row lock.
-
-### 3. Idempotency that holds under simultaneous duplicates
-
-Sequential retry protection is easy. Simultaneous duplicates are the hard case,
-and the whole mechanism is one unique index:
-
-```sql
-UNIQUE (user_id, idempotency_key)
-```
-
-1. Claim the key with `INSERT … ON CONFLICT DO NOTHING RETURNING id`.
-2. The **loser** gets no error and no row — Postgres makes its INSERT *wait* on
-   the winner's uncommitted tuple. By the time it returns zero rows, the winner
-   has already committed or aborted. There is no window where both proceed.
-3. If the winner committed, the loser's next statement sees the finished row
-   (READ COMMITTED takes a fresh snapshot per statement) and replays the stored
-   response.
-4. If the winner **aborted**, its tuple is dead, so the loser's own INSERT
-   succeeds and it becomes the new winner.
-
-Step 4 means a failed attempt *releases* the key rather than poisoning it —
-which is what you want: a transfer rejected for insufficient funds should be
-retryable with the same key once the wallet is funded.
-
-Step 3 is why `runIdempotent()` asserts READ COMMITTED at runtime. Under
-REPEATABLE READ the transaction's snapshot predates the winner's commit, the
-follow-up SELECT would find nothing, and the design would break subtly. The
-assertion turns that into an immediate, explicit failure.
-
-The request body is fingerprinted with **canonical JSON** (keys sorted
-recursively), so a client whose serialiser emits keys in a different order on
-retry is not falsely accused of reusing a key with a different payload.
-
-**Lock ordering across resource types**: the idempotency row is always acquired
-*before* any wallet row, on every path. Mixing those orderings would reintroduce
-exactly the cycle the wallet ordering eliminates.
-
-### 4. Overdrafts are impossible, not merely checked
-
-The overdraft check is sound *because* it runs while holding the source wallet's
-row lock. No other transaction can append entries for that wallet between the
-balance read and the insert, so the balance being decided on cannot go stale.
-
-Belt and braces: a `system` wallet is the only kind permitted to go negative,
-enforced by a `CHECK` constraint rather than application logic.
+**Concurrent idempotency.** A unique index on `(user_id, idempotency_key)` elects
+one winner. The loser's `INSERT … ON CONFLICT DO NOTHING` *blocks* on the
+winner's uncommitted tuple, so by the time it returns zero rows the winner has
+already committed or aborted — there is no window where both proceed. If the
+winner committed, the loser replays the stored response; if it aborted, the loser
+becomes the new winner. Because the claim shares a transaction with the effect,
+there is no `in_progress` state for any other session to observe.
 
 ---
 
-## Tests
+## Testing
 
 ```bash
-npm test                  # everything
+npm test                  # all 118
 npm run test:unit         # pure, no database
-npm run test:integration  # real Postgres
-TEST_LOG_LEVEL=debug npm test   # see application logs
+npm run test:integration  # real PostgreSQL
 ```
-
-**107 tests**, all against a real Postgres for anything touching the database.
-There is no mocked database in the concurrency tests — mocked, they would assert
-nothing.
 
 | Suite | Covers |
 |---|---|
 | `unit/money` | bigint parsing, precision past 2⁵³, float rejection |
-| `unit/ledger` | balance derivation, matched pairs, global invariant, lock ordering |
-| `unit/rateLimit` | bucket isolation per credential and route |
-| `integration/transfers` | happy path (both ledger rows verified), overdraft with no partial write, validation |
-| `integration/idempotency` | sequential replay, **40 concurrent duplicates → exactly one transfer**, payload-mismatch conflict, per-user key scoping |
-| `integration/concurrency` | **200 parallel transfers**, exact balance, zero drift, overdraft impossible under contention |
+| `unit/ledger` | balance derivation, matched pairs, invariant, lock ordering |
+| `unit/rateLimit` | per-credential bucket isolation |
+| `integration/transfers` | happy path (both ledger rows verified), overdraft with no partial write |
+| `integration/idempotency` | sequential replay, **40 concurrent duplicates → one transfer** |
+| `integration/concurrency` | **200 parallel transfers**, exact balance, zero drift |
 | `integration/deadlock` | bidirectional A↔B, three-wallet cycle, contention under scarce funds |
 | `integration/auth` | rotation, reuse rejection, family revocation, `alg:none` rejection |
 | `integration/authorization` | cross-user reads and transfers blocked |
-| `integration/schema-invariants` | the database refuses single-sided entries and ledger mutation |
+| `integration/schema-invariants` | the database itself refuses single-sided entries |
 
-### A note on what the stress test actually proves
+There is no mocked database anywhere in the concurrency tests — mocked, they
+would assert nothing.
+
+### What the stress test actually proves
 
 The obvious stress test — *"fire 200 parallel transfers, assert the balance is
-exact"* — **does not discriminate in this architecture**, and it is worth
-knowing why before trusting it.
+exact"* — **cannot fail in this architecture**, and that is worth understanding
+before trusting it.
 
-Because balances are derived by `SUM()` over append-only rows, concurrent
-appends never overwrite each other. The sum comes out exact and drift stays zero
-*even with no locking at all*. A completely unsynchronised implementation passes
-that assertion every time. Money is conserved either way.
+Because balances are derived by `SUM()` over append-only rows, concurrent appends
+never overwrite each other. The sum is exact and drift stays zero *with no
+locking at all*. An unsynchronised implementation passes every time. Money is
+conserved; the wallet is also overdrawn.
 
-What concurrency actually breaks in a derived-balance ledger is the
-**read-then-write decision**: the overdraft check. So the discriminating test
-funds a wallet with *half* of what the burst attempts and asserts that exactly
-the affordable number of transfers commit.
-
-That distinction is not theoretical. Against the deliberately unlocked first
-implementation (see the commit history), the naive assertions passed and the
-underfunded one failed with:
+What concurrency actually breaks here is the read-then-write **decision** — the
+overdraft check. So the discriminating test funds a wallet with *half* of what
+the burst attempts and asserts exactly the affordable number commit. Against the
+deliberately unlocked first implementation (see commit `ae50bfb` → `d49b418`):
 
 ```
 ● permits exactly as many concurrent transfers as the wallet can afford
@@ -506,80 +290,56 @@ underfunded one failed with:
     Received:    -2200n
 ```
 
-Both variants are kept. The exact-balance one guards conservation; the
-underfunded one guards serialisation.
+Both variants are kept: one guards conservation, the other serialisation.
 
-Similarly, the deadlock tests assert on a **deadlock counter**, not on HTTP
-status. `withTransaction` retries `40P01` up to three times, so a lock-ordering
-bug could otherwise hide behind the retry and still return `201`.
-
-### CI
-
-`.github/workflows/ci.yml` runs on every push and PR against a **real Postgres
-16 service container**, on Node 20 and 22: typecheck → unit → integration →
-migrate from scratch → seed → assert `SUM(signed_amount) = 0` over the whole
-ledger.
+Likewise the deadlock tests assert on a **deadlock counter**, not HTTP status.
+`withTransaction` retries `40P01`, so a lock-ordering bug could otherwise hide
+behind the retry and still return `201`.
 
 ---
 
 ## Project layout
 
 ```
-migrations/            numbered SQL, checksum-guarded, one transaction each
-scripts/
-  migrate.ts           npm run migrate
-  seed.ts              demo data, funded via real double-entry transfers
+migrations/     numbered SQL, checksum-guarded, one transaction each
+scripts/        migrate.ts, seed.ts
 src/
-  app.ts               express wiring
-  index.ts             server + graceful shutdown
-  config.ts            Zod-parsed env, fails fast at boot
-  db/
-    pool.ts            pg pool; int8 stays a string on purpose
-    tx.ts              withTransaction + the isolation-level rationale
-    migrate.ts         advisory-locked migration runner
-  domain/              PURE. no I/O, no imports from the rest of the app
-    money.ts           bigint minor units
-    ledger.ts          balance derivation, matched pairs, lockOrder()
-  middleware/          auth, rbac, idempotency guard, rate limit, errors
+  domain/       PURE — no I/O, no app imports (money.ts, ledger.ts)
+  db/           pool, withTransaction + isolation rationale, migration runner
+  middleware/   auth, RBAC, idempotency guard, rate limit, errors
   modules/
-    auth/              argon2id, JWT, rotating refresh with reuse detection
-    wallets/           derived balances, ownership
-    transfers/         THE CORE — lock ordering lives here
-    idempotency/       runIdempotent()
+    auth/       Argon2id, JWT, rotating refresh with reuse detection
+    wallets/    derived balances, ownership
+    transfers/  core — lock ordering lives here
+    idempotency/
 tests/
-  unit/                no database
-  integration/         real Postgres
-  setup/               test db lifecycle, fixtures, assertion helpers
+  unit/         no database
+  integration/  real PostgreSQL
 ```
-
-### Environment
-
-See `.env.example`. `.env` is gitignored and no secrets are committed; the
-example values are placeholders that fail the ≥32-char check only if you
-shorten them, and must be replaced for any real deployment
-(`openssl rand -hex 32`).
 
 ---
 
-## Scope
+## Scope and known limitations
 
 **Built:** auth with refresh rotation, RBAC, multiple wallets per user,
 transfers, double-entry ledger, derived balances, mandatory idempotency, row
 locking with deterministic ordering, full test suite, CI.
 
-**Deliberately not built:** webhooks, HMAC verification, refunds/reversals,
-reconciliation cron, admin dashboard, multi-currency, FX, PDF statements, fraud
-rules, and rate limiting beyond the auth endpoints.
+**Intentionally out of scope:** webhooks, refunds/reversals, reconciliation cron,
+admin dashboard, multi-currency, FX, PDF statements, fraud rules, and rate
+limiting beyond auth endpoints.
 
-### Known limitations
+**Limitations**, stated rather than glossed over:
 
-- **The rate limiter is in-process**, so behind N replicas the effective limit
-  is N× the configured value. Fine for this scope; a real deployment moves it to
-  Redis or the edge.
-- **Balance derivation is O(entries per wallet).** Correct at any scale, slower
-  as history grows. The covering index on `(wallet_id) INCLUDE (signed_amount)`
-  keeps it index-only. A wallet with millions of entries would want periodic
-  checkpoint rows — a cached *sum*, still derived and still verifiable, rather
-  than a mutable balance column.
+- **The rate limiter is in-process**, so behind N replicas the effective limit is
+  N× the configured value. A production deployment moves it to Redis or the edge.
+- **Balance derivation is O(entries per wallet).** Correct at any scale, slower as
+  history grows. A covering index keeps it index-only; a wallet with millions of
+  entries would want periodic checkpoint rows — a cached *sum*, still derived and
+  still verifiable, rather than a mutable balance column.
 - **Lock contention is per wallet.** A single wallet is a serialisation point by
-  design. That is the correct trade for money, but a very hot wallet will queue.
+  design. Correct for money, but a very hot wallet will queue.
+
+## License
+
+MIT
