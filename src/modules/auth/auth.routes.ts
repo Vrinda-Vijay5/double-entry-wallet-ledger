@@ -9,6 +9,7 @@ import { idempotencyKeyOf, requireIdempotencyKey } from '../../middleware/idempo
 import { runIdempotent } from '../idempotency/idempotency';
 import { LoginSchema, RefreshSchema, RegisterSchema } from './auth.schemas';
 import {
+  burnVerifyForTiming,
   findUserByEmail,
   issueTokenPair,
   registerUser,
@@ -56,12 +57,9 @@ export function authRoutes(): Router {
 
         // Identical error and comparable timing for "no such user" and "wrong
         // password": distinguishing them turns login into an account-enumeration
-        // oracle. The dummy verify keeps the timing profile similar.
+        // oracle.
         if (!user) {
-          await verifyPassword(
-            '$argon2id$v=19$m=1024,t=1,p=1$YWFhYWFhYWFhYWFhYWFhYQ$Rdescudvr7BF1bnCb8g8kKvSlLQeCbBhRlc0GmQqWDM',
-            input.password,
-          );
+          await burnVerifyForTiming(input.password);
           throw new UnauthorizedError('invalid email or password');
         }
 

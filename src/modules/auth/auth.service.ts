@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import argon2 from 'argon2';
 import type { PoolClient } from 'pg';
 import { ConflictError, UnauthorizedError } from '../../errors';
+import { getPool } from '../../db/pool';
 import { logger } from '../../logger';
 import {
   type Role,
@@ -29,10 +30,12 @@ const ARGON2_OPTIONS: argon2.Options = {
   parallelism: 1,
 };
 
+// timeCost has a hard floor of 2 in argon2; memoryCost is the knob that
+// actually buys back test runtime, so it takes the reduction.
 const TEST_ARGON2_OPTIONS: argon2.Options = {
   type: argon2.argon2id,
   memoryCost: 1024,
-  timeCost: 1,
+  timeCost: 2,
   parallelism: 1,
 };
 
@@ -51,6 +54,28 @@ export async function verifyPassword(hash: string, password: string): Promise<bo
     // Malformed stored hash -- treat as a failed login, never as a crash.
     return false;
   }
+}
+
+/**
+ * Timing equaliser for logins against a nonexistent email.
+ *
+ * Returning early when no user row exists makes login measurably faster for
+ * unknown addresses than for known ones, which is an account-enumeration oracle
+ * an attacker can read off a stopwatch. Burning one real verify against a
+ * throwaway hash keeps the two paths comparable.
+ *
+ * The decoy is derived from the SAME cost parameters as real hashes and
+ * memoised, so it stays honest if those parameters change and costs one hash
+ * per process rather than one per request.
+ */
+let decoyHashPromise: Promise<string> | null = null;
+
+export async function burnVerifyForTiming(password: string): Promise<void> {
+  decoyHashPromise ??= argon2.hash(
+    'timing-decoy-never-a-real-password',
+    argonOptions(),
+  );
+  await verifyPassword(await decoyHashPromise, password);
 }
 
 export interface UserRow {
@@ -177,15 +202,19 @@ export async function rotateRefreshToken(
 
   const alreadyUsed = row.replaced_by !== null || row.revoked_at !== null;
   if (alreadyUsed) {
-    await client.query(
-      `UPDATE refresh_tokens
-          SET revoked_at = now()
-        WHERE family_id = $1 AND revoked_at IS NULL`,
-      [row.family_id],
-    );
+    // The revocation MUST NOT run on `client`. This function always throws on
+    // this path, and the caller wraps it in a transaction that will therefore
+    // ROLL BACK -- taking the revocation with it and silently discarding the
+    // entire breach response. The family would stay live and the thief would
+    // keep their working token chain.
+    //
+    // So the revocation is committed out-of-band on its own connection, before
+    // the rejection propagates. Rolling back the *rejection* is fine; rolling
+    // back the *containment* is not.
+    await revokeTokenFamilyOutOfBand(row.family_id);
     logger.warn(
       { userId: row.user_id, familyId: row.family_id },
-      'refresh token reuse detected; revoking token family',
+      'refresh token reuse detected; revoked token family',
     );
     throw new UnauthorizedError('refresh token has already been used');
   }
@@ -202,6 +231,26 @@ export async function rotateRefreshToken(
     row.family_id,
     row.id,
   );
+}
+
+/**
+ * Revokes an entire token family on a connection of its own, outside any
+ * caller-supplied transaction, so the write commits even though the request
+ * that triggered it is about to fail. See the call site for why that matters.
+ */
+async function revokeTokenFamilyOutOfBand(familyId: string): Promise<void> {
+  const client = await getPool().connect();
+  try {
+    // No BEGIN: this single statement autocommits immediately.
+    await client.query(
+      `UPDATE refresh_tokens
+          SET revoked_at = now()
+        WHERE family_id = $1 AND revoked_at IS NULL`,
+      [familyId],
+    );
+  } finally {
+    client.release();
+  }
 }
 
 export async function revokeAllTokensForUser(
