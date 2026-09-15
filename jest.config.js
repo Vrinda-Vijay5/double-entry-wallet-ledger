@@ -1,6 +1,6 @@
 /** @type {import('jest').Config} */
 const tsJestTransform = {
-  '^.+\\.ts$': ['ts-jest', { tsconfig: '<rootDir>/tsconfig.json', isolatedModules: true }],
+  '^.+\\.ts$': ['ts-jest', { tsconfig: '<rootDir>/tsconfig.json' }],
 };
 
 module.exports = {
