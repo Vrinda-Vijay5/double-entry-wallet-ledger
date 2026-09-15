@@ -46,9 +46,27 @@ export function authRoutes(): Router {
     }),
   );
 
+  /**
+   * Login is mutating -- it issues a refresh token, inserting a row -- so it
+   * carries the Idempotency-Key requirement like every other mutating endpoint.
+   *
+   * It enforces PRESENCE only, and does not replay a cached response through
+   * runIdempotent(). That is the same deliberate boundary /register sits on:
+   * runIdempotent stores the handler's response body in
+   * idempotency_keys.response_body, and a login response contains a RAW refresh
+   * token. Caching it would write plaintext token material into a second table,
+   * defeating the point of storing only HMACs in refresh_tokens.
+   *
+   * Duplicate-submission safety comes from the credentials themselves rather
+   * than from a stored response: a replayed login re-verifies the password and
+   * issues a fresh token pair, which is correct -- tokens are meant to be
+   * single-use per issuance, and handing the same one back twice would be worse
+   * than issuing a new one.
+   */
   router.post(
     '/login',
     limiter,
+    requireIdempotencyKey,
     asyncHandler(async (req, res) => {
       const input = LoginSchema.parse(req.body);
 

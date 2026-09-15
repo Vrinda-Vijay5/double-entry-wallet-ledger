@@ -138,6 +138,7 @@ describe('authorization', () => {
       // Re-login so the access token carries the new role.
       const login = await request(app())
         .post('/v1/auth/login')
+        .set('Idempotency-Key', idempotencyKey())
         .send({ email: admin.email, password: admin.password });
       expect(login.body.user.role).toBe('admin');
 
@@ -154,6 +155,7 @@ describe('authorization', () => {
       await promoteToAdmin(admin.id);
       const login = await request(app())
         .post('/v1/auth/login')
+        .set('Idempotency-Key', idempotencyKey())
         .send({ email: admin.email, password: admin.password });
 
       const res = await request(app())
