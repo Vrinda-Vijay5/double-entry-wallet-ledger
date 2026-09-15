@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ledger-postgres
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger
+      POSTGRES_DB: ledger
+    ports:
+      - "5432:5432"
+    volumes:
+      - ledger-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # The suite creates/drops ledger_test, so wait for a genuinely ready server.
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    command:
+      # Raise max_connections: the stress tests open a large parallel pool.
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "log_lock_waits=on"
+      # Surface real deadlocks fast instead of hanging the suite for a second.
+      - "-c"
+      - "deadlock_timeout=200ms"
+
+volumes:
+  ledger-pgdata:
