@@ -388,7 +388,8 @@ it, all append.
 **How this design avoids it:** the discriminating test funds a wallet with *half*
 of what the burst attempts and asserts exactly the affordable number commit and
 the balance never goes negative. Verified against the deliberately unlocked first
-implementation (see commit history):
+implementation — commit `cd3a851` (RED, the failing stress test) followed by
+`d9f6948` (GREEN, the lock-ordering fix):
 
 ```
 ● permits exactly as many concurrent transfers as the wallet can afford

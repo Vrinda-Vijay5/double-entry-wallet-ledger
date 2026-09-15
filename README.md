@@ -281,7 +281,7 @@ conserved; the wallet is also overdrawn.
 What concurrency actually breaks here is the read-then-write **decision** — the
 overdraft check. So the discriminating test funds a wallet with *half* of what
 the burst attempts and asserts exactly the affordable number commit. Against the
-deliberately unlocked first implementation (see commit `ae50bfb` → `d49b418`):
+deliberately unlocked first implementation (see commit `cd3a851` → `d9f6948`):
 
 ```
 ● permits exactly as many concurrent transfers as the wallet can afford
